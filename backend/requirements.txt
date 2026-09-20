@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+pandas
+scipy
+statsmodels
+scikit-learn
+shap
+lightgbm
+pyarrow
+python-multipart
+httpx

@@ -1,0 +1,383 @@
+
+### Endpoints
+
+POST /api/upload
+  - Accepts multipart file (CSV or parquet)
+  - Parses to DataFrame, stores in memory with a UUID dataset_id
+  - Returns: { dataset_id, name, rows, columns, preview: first 5 rows as JSON }
+
+POST /api/analyse
+  Body: { dataset_id: str, intent: str, depth: "quick" | "deep" | "stress" }
+  - Runs full pipeline (see Pipeline section below)
+  - Streams progress events as newline-delimited JSON so frontend can show live progress
+  - Each event: { stage: str, message: str, progress: 0-100 }
+  - Final event: { stage: "complete", findings: [...], model: {...}, stress_test: {...} }
+
+GET /api/dataset/{dataset_id}
+  - Returns dataset metadata + preview
+
+GET /api/findings/{dataset_id}
+  - Returns ranked findings array
+
+GET /api/model/{dataset_id}
+  - Returns model metrics, feature importance, training provenance
+
+GET /api/stress/{dataset_id}
+  - Returns stress test results
+
+POST /api/consultant
+  Body: { dataset_id: str, message: str, history: [{role, content}] }
+  - Streams response from Ollama with full context injected
+  - Returns Server-Sent Events stream
+
+GET /api/report/{dataset_id}
+  - Returns structured report JSON (used by frontend to render PDF)
+
+GET /api/hardware/status
+  - Returns { nrf_connected: bool, nrf_data: {...} | null }
+  - Never fails — if hardware not present, returns nrf_connected: false
+
+GET /api/ws/live
+  - WebSocket endpoint
+  - Streams live sensor data if nRF54LM20 connected
+  - Streams { source: "nrf", timestamp, values: {...}, anomaly: bool | null }
+  - If no hardware, sends keepalive ping every 5s so frontend connection stays open
+
+---
+
+## ANALYSIS PIPELINE
+
+Run these stages in order. Emit a progress SSE event after each stage completes.
+
+### Stage 1: Schema Inference (schema_inference.py)
+For each column detect:
+  - dtype: numeric / categorical / datetime / boolean / text
+  - For numeric: min, max, mean, std, null_pct, is_time_series (True if monotonically increasing or named with time keywords)
+  - For categorical: cardinality, top values
+  - For datetime: range, inferred frequency
+Return a schema dict. Emit { stage: "schema", message: "Schema inferred — {n} columns, {k} time-series detected", progress: 10 }
+
+### Stage 2: Data Quality Score (data_quality.py)
+Compute:
+  - completeness: 1 - mean(null_pct across columns)
+  - outlier_rate: fraction of rows with any column > 3 std from mean
+  - drift_score: for time-series columns, compute coefficient of variation across rolling windows. High drift = low score.
+  - overall_quality: weighted mean of above, 0-1
+Emit { stage: "quality", message: "Data quality scored — {score:.0%} overall", progress: 20 }
+
+### Stage 3: Hypothesis Generation (llm_client.py -> Ollama)
+Build a prompt:
+  System: "You are a senior quantitative analyst. Given a dataset schema and a user's analytical intent, return a JSON analysis plan. Return ONLY valid JSON, no preamble, no markdown."
+  User: "Schema: {schema_json}\n\nIntent: {intent}\n\nReturn a JSON object with key 'hypotheses': an array of up to 6 objects, each with keys: 'name' (short title), 'type' ('correlation'|'anomaly'|'trend'|'leading_indicator'|'regime_change'), 'target_column' (column to analyse), 'feature_columns' (array of columns to use), 'description' (one sentence)."
+Call Ollama at http://localhost:11434/api/generate, model llama3.1:8b, stream: false
+Parse response JSON. If malformed, fall back to generating 3 default hypotheses from the schema (top numeric columns).
+Emit { stage: "hypotheses", message: "Analysis plan generated — {n} hypotheses", progress: 30 }
+
+### Stage 4: Stats Pipeline (stats_pipeline.py)
+For each hypothesis, run the appropriate analysis:
+
+CORRELATION:
+  - Pearson and Spearman r between target and each feature
+  - p-value for each
+  - Return top 5 correlations with r, p, direction
+
+ANOMALY:
+  - Fit IsolationForest on the relevant columns
+  - Return anomaly rate, top anomalous rows (as row indices + anomaly score)
+  - Also run CUSUM on time-series columns if present
+
+TREND:
+  - STL decomposition (statsmodels) on the target column
+  - Return trend direction, seasonality strength, residual variance
+
+LEADING_INDICATOR:
+  - Granger causality test between feature columns and target column at lags 1-5
+  - Return lag with lowest p-value per feature pair
+
+REGIME_CHANGE:
+  - CUSUM or PELT changepoint detection on target column
+  - Return changepoint locations + magnitude
+
+Emit { stage: "stats", message: "Statistical analysis complete — {n} tests run", progress: 55 }
+
+### Stage 5: Model Builder (model_builder.py)
+  - Select target column: highest-variance numeric column not used as a feature, or the column most referenced in the intent (ask Ollama to pick if ambiguous, one-word response)
+  - Feature columns: all numeric columns except target
+  - Drop rows with null in target
+  - Train/test split: 80/20, shuffle=False if time-series detected
+  - Train LightGBM regressor (or classifier if target is binary/categorical)
+  - Compute SHAP values for feature importance
+  - Record: model_type, accuracy (R2 or F1), feature_importance (column -> shap_value), training_rows, training_time_ms, trained_on: "ASUS GX10 (remote)" if SSH available else "local"
+  - If depth == "quick": use 100 estimators. If "deep" or "stress": 500 estimators.
+Emit { stage: "model", message: "Model trained — {metric_name}: {metric_value:.3f}", progress: 70 }
+
+### Stage 6: Stress Tester (stress_tester.py) — only if depth != "quick"
+  - Take the top 5 features by SHAP importance
+  - For each feature, perturb by: -50%, -25%, +25%, +50%, +100%, set to min, set to max, set to 0
+  - Record model output change and confidence change for each perturbation
+  - Flag as STABLE (green) if output changes < 10%, DEGRADED (amber) if 10-30%, BROKEN (red) if > 30%
+  - Find the 3 worst edge cases: specific combination of feature values where model confidence drops most
+  - Format edge cases as plain-English descriptions
+Emit { stage: "stress", message: "Stress test complete — {n_broken} critical edge cases found", progress: 85 }
+
+### Stage 7: Finding Ranker + LLM Explanations (finding_ranker.py + llm_client.py)
+  - Rank all findings by: primary sort = statistical significance (p-value ascending, anomaly score descending), secondary sort = effect size
+  - For each top 5 finding, call Ollama:
+    Prompt: "You are a senior data analyst. Explain this finding in 2 sentences for a non-technical executive. Finding: {finding_json}. Dataset intent: {intent}. Return only the explanation, no preamble."
+  - Attach explanation to each finding
+Emit { stage: "findings", message: "Findings ranked — {n} significant signals identified", progress: 95 }
+
+### Stage 8: Report Generation
+  - Compile all outputs into a structured report dict
+  - Call Ollama once for executive summary (3-4 sentences)
+  - Store report in dataset store
+Emit { stage: "complete", message: "Analysis complete", progress: 100, report_ready: true }
+
+---
+
+## OPTIONAL HARDWARE (nRF54LM20 over BLE)
+
+### ble_listener.py
+  - Try to import bleak at module load time. If ImportError, set HW_AVAILABLE = False and all functions return None gracefully.
+  - If bleak available, scan for BLE devices advertising service UUID "12345678-1234-1234-1234-123456789abc" (the Signal service UUID — hardcode this, tell user to use same UUID in firmware)
+  - On connect, subscribe to characteristic for sensor data (notify)
+  - Parse incoming bytes: struct format "fffB" = temperature (float), humidity (float), pressure (float), anomaly_flag (uint8)
+  - Emit parsed readings to an asyncio queue consumed by the WebSocket endpoint
+  - Reconnect automatically on disconnect with 2s backoff
+  - Status endpoint returns connected device name + RSSI + last_reading + last_anomaly_timestamp
+
+### Integration rules
+  - Hardware is NEVER required for any analysis feature
+  - If hardware not connected: Live Monitor screen shows a "No hardware connected" empty state with instructions for connecting the nRF54LM20 DK
+  - If hardware connected: Live Monitor shows live waveforms and anomaly feed
+  - Hardware data can be optionally included as a dataset: button in Live Monitor "Add to analysis" streams the last N readings into a new dataset_id and runs the full pipeline on it
+  - The hardware section in the demo script is clearly optional — "if we had the nRF54LM20 connected, you'd see live edge inference here"
+
+---
+
+## FRONTEND — SCREENS
+
+### Screen 1: Workspace (/workspace)
+  Top nav: "SIGNAL" wordmark left (Inter, weight 600, #F0F0FF, letter-spacing 0.15em). Right: hardware status indicator dot (green if nRF connected, grey if not) + "Hardware" label. GX10 status: "GX10 1 PFLOP" in green if Ollama reachable, amber "LLM offline" if not.
+  
+  Hero area: subtle radial gradient centered, from #1A1A3A at center to #0A0A0F at edges, covers top 30% of page. Text: "What do you want to understand?" in 32px, weight 300. Below: subtext "Upload a dataset or connect a data source to begin" in text-secondary.
+  
+  Dataset grid: 3 columns, gap-4. Each card: surface background, 1px border, no shadow. Top row: dataset name (text-primary, weight 500) + source badge. Source badges: small pill, 6px padding, "LIVE" in accent-blue background, "UPLOADED" in surface-raised with border, "PUBLIC" in purple. Middle: row count + column count in mono font, text-muted. Bottom: last updated timestamp + a small coloured health bar (full width, 3px tall, colour based on quality score: green/amber/red). Hover: border goes to #3B82F6. Live sources have a 2px blue animated pulse dot top-right of card.
+  
+  Empty state: centred, large "+" icon in text-muted, "Add your first dataset" text, "Upload CSV" and "Connect hardware" buttons side by side.
+  
+  Token savings counter: bottom right of workspace, fixed position. Small dark pill: "Saved vs cloud API: $0.00". This increments in real time as LLM calls are made. Estimate $0.003 per 1k tokens at GPT-4 rates, count all tokens sent to Ollama.
+
+### Screen 2: Add Dataset (/add)
+  Full-page flow, 3 steps with a stepper indicator at top (dots, not numbers).
+  
+  Step 1 — Source:
+    Three large cards (equal width, stacked vertically on mobile, row on desktop):
+    "Upload File" — icon: upload arrow. Subtext: "CSV or Parquet, up to 500MB". On click: show drag-drop zone inside the card, dashed border, "Drop file here or click to browse".
+    "Live Hardware" — icon: radio wave. Subtext: "nRF54LM20 over BLE". Show hardware status. If not connected: grey, "Not detected — connect nRF54LM20 DK". If connected: blue, "Device found — click to use".
+    "Public Dataset" — icon: globe. Subtext: "Browse Voloridge datasets". On click: show list of curated dataset names with sizes (hardcode a list of the Voloridge dataset categories: earth observation, healthcare, transportation, climate, genomics, economics).
+  
+  Step 2 — Intent:
+    Large textarea, autofocus. Label: "What are you trying to understand?" Placeholder: "e.g. Find early warning signals for extreme weather events 48 hours before they occur"
+    Below: three example chips that populate the textarea on click:
+      "Find leading indicators of X in this data"
+      "Detect anomalies and explain what's driving them"  
+      "Identify the most significant trends and what's causing them"
+    Preview panel on right: shows dataset name, row count, column list from step 1.
+  
+  Step 3 — Depth:
+    Three cards:
+    "Quick Scan" — "~2 minutes" — "Schema analysis, correlation sweep, top findings. No model training."
+    "Deep Analysis" — "~8 minutes" — "Full statistical suite, model training on GX10, ranked findings with explanations." — RECOMMENDED badge
+    "Full Stress Test" — "~20 minutes" — "Everything above plus adversarial testing and edge case discovery."
+    
+  Confirm button at bottom: "Begin Analysis" — accent blue background, full width, weight 600.
+
+### Screen 3: Analysis View (/analysis/:dataset_id)
+  Two-panel layout: left sidebar 220px fixed, right panel fills remaining width.
+  
+  Sidebar:
+    Dataset name at top, source badge below it.
+    Vertical nav list. Each item: icon + label. Items: Overview, Findings, Model, Stress Test, Consultant, Report.
+    Active item: left 2px #3B82F6 border, text-primary. Inactive: text-secondary.
+    Bottom of sidebar: dataset stats in mono font, text-muted. Rows: {n}. Columns: {n}. Quality: {score}%.
+  
+  Overview tab:
+    While analysis running: live progress feed. Each stage appears as a new row:
+      Left: coloured dot (spinning while active, solid green when done, red on error)
+      Centre: stage message in text-primary
+      Right: timestamp in mono, text-muted
+    Stages appear one by one as SSE events arrive. Smooth fade-in animation on each row.
+    Progress bar at top: thin, 2px, accent-blue, animated fill.
+    When complete: summary card appears below the log: "{n} findings, model accuracy {x}, {n} edge cases found."
+  
+  Findings tab:
+    Ranked list of finding cards. Each card:
+      Top row: finding name (weight 600) + type badge (colour-coded: CORRELATION blue, ANOMALY red, TREND green, LEADING_INDICATOR purple, REGIME_CHANGE amber) + confidence badge (p-value in mono font, green if < 0.01, amber if < 0.05)
+      Middle: two-sentence LLM explanation in text-secondary
+      Bottom row: key metric in mono (e.g. "r = 0.847") + affected columns as small grey chips
+      Right edge: a 60px wide sparkline (Recharts LineChart, no axes, just the line) of the most relevant column
+    On click: card expands. Shows full statistical breakdown table, a larger chart of the relevant feature over time or distribution, and a "Why this matters" paragraph from the LLM.
+    Top of tab: filter bar. Small toggle buttons: ALL / CORRELATION / ANOMALY / TREND / LEADING_INDICATOR. One active at a time. Filters the cards.
+  
+  Model tab:
+    Two columns.
+    Left: Feature importance. Horizontal bar chart (Recharts). Bars are accent-blue. Y-axis: column names. X-axis: SHAP value. Label above: "Feature Importance (SHAP)" in text-secondary, small.
+    Right: Model metrics. Cards for: Accuracy metric name + value (large, mono, accent-blue), Training rows, Training time, Trained on (shows "ASUS GX10 — 1 PFLOP Blackwell" if remote, "Local" if not). Below metrics: small confusion matrix or residuals plot depending on model type.
+    Below both columns: "Model trained on {date} {time}" in mono, text-muted.
+  
+  Stress Test tab:
+    Only shown if depth was "deep" or "stress". Otherwise shows "Run a Deep Analysis or Stress Test to unlock this." with a button.
+    Top: perturbation matrix. Table. Rows: top 5 features. Columns: perturbation levels. Each cell: coloured background (green #10B981 at 15% opacity, amber #F59E0B at 15%, red #EF4444 at 15%) + short label ("Stable", "Degraded", "Broken"). Cell text in mono.
+    Below: "Critical Edge Cases" section. Three cards, each with: a title "Edge Case {n}" and a plain-English description of the specific condition. Red left border on each card.
+  
+  Consultant tab:
+    Chat interface. Full height of panel minus sidebar.
+    Messages: user messages right-aligned, surface-raised background, text-primary. Signal messages left-aligned, no background, text-primary. Each Signal message prefixed with small "S" in accent-blue circle.
+    Input: fixed to bottom. Text input full width, send button right. Placeholder: "Ask anything about this dataset or analysis..."
+    Signal has full context: dataset schema, all findings, model performance, stress test results. This is injected as system context on every call to Ollama.
+    Responses stream token by token (SSE from /api/consultant). Show blinking cursor while streaming.
+    Pre-populate three suggested questions as chips above input on first load:
+      "What's the single most actionable finding?"
+      "Where is this model most likely to fail in production?"
+      "What additional data would most improve this analysis?"
+    Chips disappear after first message sent.
+  
+  Report tab:
+    Preview of the full report in a white-background panel (the one light surface in the whole app — this makes it feel like a real document).
+    Sections: Cover (dataset name, date, Signal logo), Executive Summary (LLM-generated, 3-4 sentences), Findings (top 5 ranked), Model Card, Stress Test Summary, Consultant Recommendations.
+    Two buttons top-right: "Export PDF" (calls window.print() on the report panel with print CSS) and "Copy Link" (copies the analysis URL).
+
+### Screen 4: Live Monitor (/monitor)
+  If no hardware: centred empty state. Icon: radio tower. Title: "No hardware connected". Body: "Connect an nRF54LM20 DK to stream live sensor data." Below: collapsible "How to connect" with 4 steps (flash firmware, enable BLE, click Scan below, select device). Scan button: runs BLE scan for 10s, shows found devices.
+  
+  If hardware connected:
+    Top bar: device name + RSSI signal strength indicator (4 bars, greyed out based on RSSI) + "Edge NPU: Active" badge in green + "Disconnect" button.
+    
+    Waveform panel: one row per sensor channel (temperature, humidity, pressure, anomaly_score). Each row: channel name in mono left, a scrolling sparkline chart (last 60 readings, Recharts), current value large in mono right. Anomalies shown as vertical red markers on the waveform.
+    
+    Anomaly feed: right panel, 300px wide. Title: "Anomaly Events". Scrolling list of timestamped events: each row: timestamp in mono + one-line description + confidence badge. Most recent at top. "Edge inference" chip on each (distinguishes from server-side).
+    
+    "Add to Analysis" button: captures last 500 readings, creates a new dataset, redirects to /add with the data pre-loaded and a note "Live sensor capture — {timestamp}".
+
+---
+
+## ROUTING
+
+/ -> redirect to /workspace
+/workspace -> Screen 1
+/add -> Screen 2
+/analysis/:dataset_id -> Screen 3, default tab: Overview
+/analysis/:dataset_id/:tab -> Screen 3, specific tab
+/monitor -> Screen 4
+
+Use React Router v6.
+
+---
+
+## STATE MANAGEMENT
+
+Use React Context + useReducer. No Redux.
+
+Global state shape:
+{
+  datasets: { [dataset_id]: { meta, schema, findings, model, stress_test, report, status } },
+  hardware: { nrf_connected, nrf_device_name, last_reading, anomaly_feed: [] },
+  token_savings: { total_tokens: 0, estimated_savings_usd: 0 },
+  llm_online: bool
+}
+
+On app load:
+  - Poll /api/hardware/status every 3s, update hardware state
+  - Hit /api/health to check if Ollama reachable, set llm_online
+
+---
+
+## ANALYSIS PROGRESS — REAL-TIME
+
+Use EventSource (SSE) to consume the /api/analyse stream.
+Each event updates the dataset status in global state.
+The Overview tab subscribes to this and renders events as they arrive.
+On stage "complete", fetch full results from the individual endpoints and populate the dataset in state.
+
+---
+
+## ERROR HANDLING
+
+All errors must be graceful. Rules:
+  - If Ollama offline: skip LLM stages, use auto-generated finding titles and no explanations. Show "LLM offline — connect GX10 for AI explanations" banner in amber at top of analysis view. All stats still run.
+  - If hardware not present: all hardware features show empty state, nothing breaks.
+  - If dataset has < 50 rows: show warning "Small dataset — results may not be statistically reliable" but run anyway.
+  - If a stats test throws an exception: catch it, log it, skip that finding, continue.
+  - Never show a Python traceback to the user. Always show a human-readable error message.
+
+---
+
+## START SCRIPT (start.sh)
+
+```bash
+#!/bin/bash
+echo "Starting Signal..."
+
+# Backend
+cd backend
+pip install fastapi uvicorn pandas scipy statsmodels scikit-learn shap lightgbm pyarrow bleak --quiet
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload &
+BACKEND_PID=$!
+cd ..
+
+# Frontend
+cd frontend
+npm install --silent
+npm start &
+FRONTEND_PID=$!
+cd ..
+
+echo "Signal running."
+echo "  Frontend: http://localhost:3000"
+echo "  Backend:  http://localhost:8000"
+echo "  Ollama:   http://localhost:11434 (must be running separately)"
+echo ""
+echo "To connect ASUS GX10 LLM: ssh -L 11434:localhost:11434 user@<gx10-ip>"
+echo "To use nRF54LM20: flash Zephyr firmware with BLE service UUID 12345678-1234-1234-1234-123456789abc"
+
+wait $BACKEND_PID $FRONTEND_PID
+```
+
+---
+
+## WHAT TO BUILD FIRST
+
+Build in this exact order so there is always something working:
+
+1. FastAPI skeleton with /api/upload and /api/health. Returns dummy data. Confirm it runs.
+2. React app scaffold with all 4 screens, routing working, design system applied (colours, fonts, layout). All screens show correct layout with placeholder content.
+3. Wire CSV upload: file drag-drop on /add -> POST to /api/upload -> redirect to /analysis/:id showing dataset name and column list.
+4. Implement schema inference and data quality. /api/analyse emits the first 2 progress events.
+5. Implement Ollama client. Call llama3.1:8b with hypothesis prompt. Log JSON response.
+6. Implement stats pipeline for correlation and anomaly types.
+7. Wire findings to the Findings tab. Real data, real p-values, real sparklines.
+8. Implement model builder. Wire to Model tab.
+9. Implement consultant chat with SSE streaming.
+10. Implement stress tester. Wire to Stress Test tab.
+11. Implement report generation and export.
+12. Implement hardware BLE listener as optional layer. Wire to /monitor.
+13. Polish: token counter, GX10 status indicator, all empty states, all error states.
+
+Do not move to step N+1 until step N works and looks correct.
+
+---
+
+## DEMO DATASETS
+
+Include in the repo a /demo-data/ folder with:
+  - climate_sample.csv: 500 rows, columns: timestamp, temperature_c, pressure_hpa, humidity_pct, wind_speed_ms, rainfall_mm, extreme_event (0/1 binary)
+  - sensor_stream.csv: 300 rows, columns: timestamp, channel_1 through channel_5 (numeric, with injected anomalies at rows 150-155 and 280-285)
+  
+Generate realistic synthetic data for both. climate_sample should have real correlations: pressure_hpa should negatively correlate with extreme_event with p < 0.01 so the analysis produces a clear finding on demo.
+
+---
+
+## FINAL REQUIREMENT
+
+When the demo runs on the climate dataset with intent "find early warning signals for extreme weather events", the analysis must surface at least one finding with p < 0.01 and a clear, readable LLM explanation. This is the money moment of the demo. Make sure the synthetic data is designed so this finding reliably appears.
