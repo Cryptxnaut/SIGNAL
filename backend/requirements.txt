@@ -9,3 +9,6 @@ lightgbm
 pyarrow
 python-multipart
 httpx
+hmmlearn
+xgboost
+ruptures

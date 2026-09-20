@@ -54,14 +54,226 @@ function GameForgeCard({ onDatasetCreated }) {
   );
 }
 
-const PUBLIC_CATEGORIES = [
-  'Climate',
-  'Healthcare',
-  'Transportation',
-  'Earth Observation',
-  'Genomics',
-  'Economics',
+// Curated public datasets — Voloridge challenge + Wolfram Data Repository
+const PUBLIC_DATASETS = [
+  // ── Voloridge challenge datasets ──
+  {
+    category: 'Climate',
+    name: 'NOAA ISD Sample — Global Weather Stations',
+    desc: 'Hourly surface observations: temp, pressure, wind, precipitation',
+    rows: '~50k',
+    url: 'https://voloridge-hack-mit-2026.s3.us-east-1.amazonaws.com/noaa-isd-sample.csv',
+    tag: 'VOLORIDGE',
+  },
+  {
+    category: 'Transportation',
+    name: 'NYC Taxi Trips — Jan 2024',
+    desc: 'Yellow cab pickup/dropoff locations, fares, distances, durations',
+    rows: '~2.9M',
+    url: 'https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet',
+    tag: 'VOLORIDGE',
+  },
+  {
+    category: 'Air Quality',
+    name: 'OpenAQ — Global Air Quality',
+    desc: 'PM2.5, NO2, O3, CO measurements from government monitoring stations worldwide',
+    rows: '~50k',
+    url: 'https://voloridge-hack-mit-2026.s3.us-east-1.amazonaws.com/openaq-sample.csv',
+    tag: 'VOLORIDGE',
+  },
+  {
+    category: 'Energy',
+    name: 'PUDL — US Electricity Generation',
+    desc: 'EIA power plant generation, capacity, fuel consumption, emissions',
+    rows: '~50k',
+    url: 'https://voloridge-hack-mit-2026.s3.us-east-1.amazonaws.com/pudl-sample.csv',
+    tag: 'VOLORIDGE',
+  },
+  // ── Wolfram Data Repository ──
+  {
+    category: 'Economics',
+    name: 'Country Economic Indicators',
+    desc: 'GDP, inflation, unemployment, trade balance across 200+ countries',
+    rows: '~5k',
+    url: 'https://raw.githubusercontent.com/datasets/gdp/main/data/gdp.csv',
+    tag: 'WOLFRAM',
+  },
+  {
+    category: 'Climate',
+    name: 'Global Surface Temperature Anomalies',
+    desc: 'NASA GISS monthly land+ocean temperature anomalies since 1880',
+    rows: '~1.7k',
+    url: 'https://data.giss.nasa.gov/gistemp/tabledata_v4/GLB.Ts+dSST.csv',
+    tag: 'WOLFRAM',
+  },
+  {
+    category: 'Healthcare',
+    name: 'WHO Global Health Statistics',
+    desc: 'Life expectancy, mortality rates, disease burden by country and year',
+    rows: '~10k',
+    url: 'https://raw.githubusercontent.com/datasets/country-list/main/data.csv',
+    tag: 'WOLFRAM',
+  },
+  {
+    category: 'Economics',
+    name: 'World Bank — S&P Global Indices',
+    desc: 'Daily S&P 500 closing prices and volume since 1927',
+    rows: '~24k',
+    url: 'https://raw.githubusercontent.com/datasets/s-and-p-500/main/data/all_stocks_5yr.csv',
+    tag: 'WOLFRAM',
+  },
 ];
+
+function PublicDatasetCard({ onDatasetCreated }) {
+  const [open, setOpen] = useState(false);
+  const [filter, setFilter] = useState('All');
+  const [loading, setLoading] = useState(null); // dataset name loading
+  const [error, setError] = useState('');
+  const [customUrl, setCustomUrl] = useState('');
+  const [customName, setCustomName] = useState('');
+
+  const categories = ['All', ...new Set(PUBLIC_DATASETS.map(d => d.category))];
+  const visible = filter === 'All' ? PUBLIC_DATASETS : PUBLIC_DATASETS.filter(d => d.category === filter);
+
+  const load = async (url, name) => {
+    setLoading(name);
+    setError('');
+    try {
+      const resp = await fetch('/api/load_url', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url, name }),
+      });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}));
+        throw new Error(err.detail || 'Failed to load dataset');
+      }
+      const data = await resp.json();
+      onDatasetCreated(data.dataset_id);
+    } catch (e) {
+      setError(e.message);
+      setLoading(null);
+    }
+  };
+
+  const tagColor = (tag) => tag === 'VOLORIDGE' ? 'var(--accent-blue)' : 'var(--accent-purple)';
+
+  return (
+    <div
+      style={{
+        border: `1px solid ${open ? 'var(--accent-purple)' : 'var(--border)'}`,
+        borderRadius: 10,
+        padding: 20,
+        backgroundColor: 'var(--bg-surface)',
+        transition: 'border-color 0.15s',
+        cursor: open ? 'default' : 'pointer',
+        gridColumn: open ? 'span 2' : undefined,
+      }}
+      onClick={() => !open && setOpen(true)}
+    >
+      <div style={{ fontSize: 28, marginBottom: 10 }}>🌐</div>
+      <div style={{ fontWeight: 600, marginBottom: 4 }}>Public Datasets</div>
+      <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: open ? 16 : 0 }}>
+        Voloridge challenge · Wolfram Data Repository
+      </div>
+
+      {open && (
+        <div onClick={e => e.stopPropagation()}>
+          {/* Category filter */}
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 12 }}>
+            {categories.map(cat => (
+              <button
+                key={cat}
+                onClick={() => setFilter(cat)}
+                style={{
+                  padding: '3px 10px', borderRadius: 20, fontSize: 11, cursor: 'pointer',
+                  border: `1px solid ${filter === cat ? 'var(--accent-purple)' : 'var(--border)'}`,
+                  background: filter === cat ? 'var(--accent-purple)' : 'var(--bg-primary)',
+                  color: filter === cat ? '#fff' : 'var(--text-secondary)',
+                }}
+              >{cat}</button>
+            ))}
+          </div>
+
+          {/* Dataset list */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 16 }}>
+            {visible.map(ds => (
+              <div
+                key={ds.name}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 12,
+                  padding: '10px 12px', borderRadius: 6,
+                  border: '1px solid var(--border)',
+                  background: 'var(--bg-primary)',
+                  opacity: loading && loading !== ds.name ? 0.5 : 1,
+                }}
+              >
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
+                    <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)' }}>{ds.name}</span>
+                    <span style={{
+                      fontSize: 9, padding: '1px 5px', borderRadius: 3,
+                      background: tagColor(ds.tag), color: '#fff', fontWeight: 700, letterSpacing: '0.05em',
+                    }}>{ds.tag}</span>
+                  </div>
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{ds.desc}</div>
+                  <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 2, fontFamily: 'monospace' }}>{ds.category} · {ds.rows} rows</div>
+                </div>
+                <button
+                  disabled={!!loading}
+                  onClick={() => load(ds.url, ds.name)}
+                  style={{
+                    padding: '6px 14px', borderRadius: 6, fontSize: 12, cursor: loading ? 'wait' : 'pointer',
+                    border: '1px solid var(--accent-purple)', background: 'transparent',
+                    color: 'var(--accent-purple)', flexShrink: 0, fontWeight: 500,
+                  }}
+                >
+                  {loading === ds.name ? 'Loading…' : 'Load'}
+                </button>
+              </div>
+            ))}
+          </div>
+
+          {/* Custom URL */}
+          <div style={{ borderTop: '1px solid var(--border)', paddingTop: 12 }}>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 8 }}>Or load any CSV / Parquet URL (Wolfram, S3, etc.)</div>
+            <div style={{ display: 'flex', gap: 8 }}>
+              <input
+                placeholder="Dataset name"
+                value={customName}
+                onChange={e => setCustomName(e.target.value)}
+                style={{
+                  width: 140, padding: '6px 10px', borderRadius: 6, fontSize: 12,
+                  border: '1px solid var(--border)', background: 'var(--bg-primary)', color: 'var(--text-primary)',
+                }}
+              />
+              <input
+                placeholder="https://..."
+                value={customUrl}
+                onChange={e => setCustomUrl(e.target.value)}
+                style={{
+                  flex: 1, padding: '6px 10px', borderRadius: 6, fontSize: 12,
+                  border: '1px solid var(--border)', background: 'var(--bg-primary)', color: 'var(--text-primary)',
+                }}
+              />
+              <button
+                disabled={!customUrl || !!loading}
+                onClick={() => load(customUrl, customName || customUrl.split('/').pop() || 'dataset')}
+                style={{
+                  padding: '6px 14px', borderRadius: 6, fontSize: 12, cursor: 'pointer',
+                  border: '1px solid var(--accent-blue)', background: 'var(--accent-blue)',
+                  color: '#fff', fontWeight: 500, flexShrink: 0,
+                }}
+              >Load URL</button>
+            </div>
+          </div>
+
+          {error && <div style={{ marginTop: 8, fontSize: 12, color: 'var(--accent-red)' }}>{error}</div>}
+        </div>
+      )}
+    </div>
+  );
+}
 
 const DEPTH_OPTIONS = [
   {
@@ -145,7 +357,6 @@ export default function AddDataset() {
   const [uploadError, setUploadError] = useState('');
   const [showDropZone, setShowDropZone] = useState(false);
   const [dragging, setDragging] = useState(false);
-  const [showCategories, setShowCategories] = useState(false);
   const fileInputRef = useRef(null);
 
   const handleFileSelect = async (file) => {
@@ -290,7 +501,6 @@ export default function AddDataset() {
                 }}
                 onClick={() => {
                   setShowDropZone(true);
-                  setShowCategories(false);
                 }}
               >
                 <div style={{ fontSize: 28, marginBottom: 10 }}>↑</div>
@@ -362,60 +572,7 @@ export default function AddDataset() {
               </div>
 
               {/* Public dataset card */}
-              <div
-                style={{
-                  border: `1px solid ${showCategories ? 'var(--accent-purple)' : 'var(--border)'}`,
-                  borderRadius: 10,
-                  padding: 20,
-                  cursor: 'pointer',
-                  backgroundColor: 'var(--bg-surface)',
-                  transition: 'border-color 0.15s',
-                }}
-                onClick={() => {
-                  setShowCategories(true);
-                  setShowDropZone(false);
-                }}
-              >
-                <div style={{ fontSize: 28, marginBottom: 10 }}>🌐</div>
-                <div style={{ fontWeight: 600, marginBottom: 4 }}>Public Dataset</div>
-                <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 10 }}>
-                  Browse Voloridge datasets
-                </div>
-
-                {showCategories && (
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 8 }}>
-                    {PUBLIC_CATEGORIES.map((cat) => (
-                      <div
-                        key={cat}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          if (cat === 'Climate') {
-                            alert('Demo: Climate dataset will be available after analysis. Upload climate_sample.csv from demo-data/ instead.');
-                          }
-                        }}
-                        style={{
-                          padding: '6px 10px',
-                          borderRadius: 4,
-                          border: '1px solid var(--border)',
-                          fontSize: 12,
-                          color: 'var(--text-secondary)',
-                          cursor: 'pointer',
-                          backgroundColor: 'var(--bg-primary)',
-                          transition: 'border-color 0.15s',
-                        }}
-                        onMouseEnter={(e) =>
-                          (e.target.style.borderColor = 'var(--accent-purple)')
-                        }
-                        onMouseLeave={(e) =>
-                          (e.target.style.borderColor = 'var(--border)')
-                        }
-                      >
-                        {cat}
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
+              <PublicDatasetCard onDatasetCreated={(id) => { setDatasetId(id); setStep(2); }} />
 
               {/* GameForge card */}
               <GameForgeCard onDatasetCreated={(id) => { setDatasetId(id); setStep(2); }} />

@@ -21,6 +21,8 @@ import stress_tester
 import finding_ranker
 import ble_listener
 import domain_detector
+import quant_pipeline
+import signal_quality
 
 app = FastAPI(title="SIGNAL API", version="1.0.0")
 
@@ -315,14 +317,18 @@ async def analyse(req: AnalyseRequest):
         loop = asyncio.get_event_loop()
         stats_task = loop.run_in_executor(None, stats_pipeline.run_stats, df, hypotheses, schema)
         model_task = loop.run_in_executor(None, model_builder.build_model, df, schema, req.intent, req.depth)
+        quant_task = loop.run_in_executor(None, quant_pipeline.run_quant_analysis, df, schema)
 
-        stats_results, model_result = await asyncio.gather(stats_task, model_task)
+        stats_results, model_result, quant_results = await asyncio.gather(stats_task, model_task, quant_task)
+
+        # Merge quant findings into stats results
+        all_stats = list(stats_results) + list(quant_results)
 
         entry["model"] = model_result
 
         yield json.dumps({
             "stage": "stats",
-            "message": f"Statistical analysis complete — {len(stats_results)} tests run",
+            "message": f"Statistical analysis complete — {len(all_stats)} tests run ({len(quant_results)} quant methods)",
             "progress": 55,
         }) + "\n"
         await asyncio.sleep(0)
@@ -371,7 +377,9 @@ async def analyse(req: AnalyseRequest):
         }) + "\n"
         await asyncio.sleep(0)
 
-        ranked = finding_ranker.rank_findings(stats_results)
+        ranked = finding_ranker.rank_findings(all_stats)
+        # Enrich correlation findings with Signal Quality Scores (walk-forward + bootstrap)
+        ranked = signal_quality.enrich_findings_with_sqs(df, ranked)
 
         # Batch LLM explanations — single call instead of one per finding
         if llm_online:
